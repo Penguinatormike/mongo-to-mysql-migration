@@ -1,0 +1,16 @@
+#!/bin/sh
+# Blocks the commit if tests fail or any core migration file drops below 80% line coverage.
+# Install once per clone:  git config core.hooksPath .githooks
+# Needs MongoDB + MySQL on localhost (docker compose up -d mongo mysql).
+
+# Only run when Python code or the coverage config is part of the commit.
+if ! git diff --cached --name-only --diff-filter=ACMRD | grep -qE '^(migrator|tests|scripts)/.*\.py$|^\.coveragerc$'; then
+    exit 0
+fi
+
+if [ -x .venv/Scripts/python.exe ]; then PY=.venv/Scripts/python.exe
+elif [ -x .venv/bin/python ]; then PY=.venv/bin/python
+else PY=python
+fi
+
+exec "$PY" scripts/check_coverage.py --min 80

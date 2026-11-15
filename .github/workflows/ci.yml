@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    name: Tests + coverage gate
+    runs-on: ubuntu-latest
+    services:
+      mongo:
+        image: mongo:7.0
+        ports: ["27017:27017"]
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ping: 1}).ok'"
+          --health-interval 3s --health-timeout 5s --health-retries 30
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: testdb  # the tests only use `testdb`
+          MYSQL_USER: app
+          MYSQL_PASSWORD: app
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval 3s --health-timeout 5s --health-retries 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      # Runs the full suite and fails if any core file is below 80% line coverage (see AGENTS.md).
+      - run: python scripts/check_coverage.py --min 80
+
+  demo:
+    name: End-to-end demo under load
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose up -d --build
+      # Fails unless every request succeeded, no client saw inconsistent data, and no drift remains.
+      - run: docker compose run --rm --build tools demo
+      - if: failure()
+        run: docker compose logs app

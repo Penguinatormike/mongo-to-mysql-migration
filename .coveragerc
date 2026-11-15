@@ -1,0 +1,12 @@
+# Coverage scope = the core migration code. Everything under migrator/ is measured
+# (so new modules are core by default) except the CLI and the demo-only package,
+# which the end-to-end demo exercises instead of the test suite.
+[run]
+source = migrator
+omit =
+    migrator/__main__.py
+    migrator/demo/*
+
+[report]
+show_missing = true
+skip_empty = true

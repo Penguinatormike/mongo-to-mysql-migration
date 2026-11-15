@@ -1,0 +1,2 @@
+# Keep LF everywhere, so the shell hook and Docker files work no matter where the repo is checked out.
+* text=auto eol=lf
