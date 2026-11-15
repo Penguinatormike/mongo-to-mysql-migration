@@ -89,7 +89,7 @@ async def run_demo(count: int = 20_000, workers: int = 8, fault_rate: float = 0.
     banner("4. Reconcile (verify only)")
     report = await asyncio.to_thread(reconcile, mongo, mysql, "mongo", False)
     say(f"  {report.summary()}")
-    say(f"  -> {report.drift} records drifted, all from the injected shadow-write failures")
+    say(f"  -> {report.drift} records drifted: injected shadow-write failures, plus any writes that raced the backfill")
 
     banner("5. Stop injecting faults, repair until clean")
     state.set_fault_rate(0)

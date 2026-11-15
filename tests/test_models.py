@@ -13,7 +13,7 @@ def test_fingerprint_ignores_settings_key_order():
     assert a.fingerprint() == b.fingerprint()
 
 
-@pytest.mark.parametrize("field,value", [("email", "x@example.com"), ("version", 2), ("settings", {"theme": "light"})])
+@pytest.mark.parametrize("field,value", [("email", "x@example.com"), ("plan", "free"), ("settings", {"theme": "light"})])
 def test_fingerprint_changes_with_content(field, value):
     a = make_account()
     assert a.fingerprint() != replace(a, **{field: value}).fingerprint()

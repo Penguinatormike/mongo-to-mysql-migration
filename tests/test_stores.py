@@ -24,31 +24,29 @@ def test_same_record_fingerprints_equal_across_stores(stores):
 
 
 @pytest.mark.parametrize("which", ["mongo", "mysql"])
-def test_put_if_newer_never_overwrites_a_newer_copy(stores, which):
+def test_upsert_inserts_or_overwrites(stores, which):
     mongo, mysql, _ = stores
     store = {"mongo": mongo, "mysql": mysql}[which]
-    newer = make_account(version=5, display_name="new")
-    store.force_put(newer)
+    a = make_account()
+    store.upsert(a)
+    assert store.get(a.id) == a
 
-    store.put_if_newer(replace(newer, version=4, display_name="stale"))
-    store.put_if_newer(replace(newer, version=5, display_name="same version"))
-    assert store.get(newer.id).display_name == "new"
-
-    store.put_if_newer(replace(newer, version=6, display_name="newest"))
-    got = store.get(newer.id)
-    assert (got.version, got.display_name) == (6, "newest")
+    changed = replace(a, display_name="changed")
+    store.upsert_many([changed])
+    assert store.get(a.id) == changed and store.count() == 1
 
 
 @pytest.mark.parametrize("which", ["mongo", "mysql"])
-def test_update_bumps_version(stores, which):
+def test_update_applies_changes_and_touches_updated_at(stores, which):
     mongo, mysql, _ = stores
     store = {"mongo": mongo, "mysql": mysql}[which]
-    a = make_account(version=3)
+    a = make_account()
     store.create(a)
     updated = store.update(a.id, {"display_name": "Grace"})
-    assert (updated.version, updated.display_name) == (4, "Grace")
+    assert updated.display_name == "Grace"
     assert updated.updated_at > a.updated_at
     assert store.get(a.id) == updated
+    assert store.update(make_account().id, {"plan": "free"}) is None
 
 
 @pytest.mark.parametrize("which", ["mongo", "mysql"])
@@ -63,55 +61,15 @@ def test_iter_batches_walks_everything_in_order(stores, which):
     assert [a.id for batch in store.iter_batches(batch_size=10, after_id=ids[9]) for a in batch] == ids[10:]
 
 
-# --- tombstones ------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("which", ["mongo", "mysql"])
-def test_delete_leaves_a_tombstone_that_blocks_stale_copies(stores, which):
+def test_delete_removes_the_record(stores, which):
     mongo, mysql, _ = stores
     store = {"mongo": mongo, "mysql": mysql}[which]
-    a = make_account(version=2)
-    store.create(a)
-
-    assert store.delete(a.id) == 3
-    assert store.get(a.id) is None and store.get_many([a.id]) == {} and store.count() == 0
-    assert list(store.iter_batches()) == []
-    assert store.update(a.id, {"plan": "free"}) is None
-    assert store.delete(a.id) is None  # already gone
-
-    store.put_if_newer(a)  # a backfill batch read before the delete
-    store.put_if_newer_many([replace(a, version=3)])
-    store.put_tombstone(a.id, 2)
-    assert store.get(a.id) is None
-
-    store.force_put(a)  # repair from the source of truth is the one thing that may revive it
-    assert store.get(a.id) == a
-
-
-@pytest.mark.parametrize("which", ["mongo", "mysql"])
-def test_tombstone_that_arrives_first_still_blocks_older_writes(stores, which):
-    mongo, mysql, _ = stores
-    store = {"mongo": mongo, "mysql": mysql}[which]
-    a = make_account(version=2)
-    store.put_tombstone(a.id, 3)  # the delete's shadow write overtook the create's
-    store.put_if_newer(a)
-    assert store.get(a.id) is None and store.count() == 0
-
-    newer = replace(a, version=4)
-    store.put_if_newer(newer)
-    assert store.get(a.id) == newer
-
-
-def test_mysql_schema_upgrade_adds_the_deleted_column(stores):
-    _, mysql, _ = stores
-    from sqlalchemy import text
-
-    with mysql.engine.begin() as conn:
-        conn.execute(text("ALTER TABLE accounts DROP COLUMN deleted"))
-    mysql.create_schema()
     a = make_account()
-    mysql.create(a)
-    assert mysql.delete(a.id) == 2 and mysql.get(a.id) is None
+    store.create(a)
+    assert store.delete(a.id) is True
+    assert store.get(a.id) is None and store.count() == 0
+    assert store.delete(a.id) is False  # already gone
 
 
 # --- timeouts --------------------------------------------------------------------
@@ -132,5 +90,5 @@ def test_store_with_timeout_fails_fast_against_a_hung_server(hung_server, which)
         timeout_error = OperationalError
     started = time.monotonic()
     with pytest.raises(timeout_error):
-        store.put_if_newer(make_account())
+        store.upsert(make_account())
     assert time.monotonic() - started < 3

@@ -1,8 +1,4 @@
-"""MySQL store. Shares its interface with MongoStore, so the migration code can treat either as source or target.
-
-Deletes are tombstones: the row is kept with `deleted = 1` and a bumped version, so the version guard
-also stops a stale copy (a backfill batch, a late shadow update) from bringing it back.
-"""
+"""MySQL store. Shares its interface with MongoStore, so the migration code can treat either as source or target."""
 
 from __future__ import annotations
 
@@ -15,21 +11,19 @@ from sqlalchemy import bindparam, create_engine, text
 from .. import config
 from ..models import Account, utcnow
 
-_COLUMNS = "id, email, display_name, plan, settings, version, created_at, updated_at"
-_VALUES = ":id, :email, :display_name, :plan, :settings, :version, :created_at, :updated_at"
+_COLUMNS = "id, email, display_name, plan, settings, created_at, updated_at"
+_VALUES = ":id, :email, :display_name, :plan, :settings, :created_at, :updated_at"
 
 SCHEMA = [
     """
     CREATE TABLE IF NOT EXISTS accounts (
-        id           CHAR(24)        NOT NULL PRIMARY KEY,
-        email        VARCHAR(255)    NOT NULL,
-        display_name VARCHAR(255)    NOT NULL,
-        plan         VARCHAR(32)     NOT NULL,
-        settings     JSON            NOT NULL,
-        version      BIGINT UNSIGNED NOT NULL,
-        created_at   DATETIME(3)     NOT NULL,
-        updated_at   DATETIME(3)     NOT NULL,
-        deleted      BOOLEAN         NOT NULL DEFAULT FALSE
+        id           CHAR(24)     NOT NULL PRIMARY KEY,
+        email        VARCHAR(255) NOT NULL,
+        display_name VARCHAR(255) NOT NULL,
+        plan         VARCHAR(32)  NOT NULL,
+        settings     JSON         NOT NULL,
+        created_at   DATETIME(3)  NOT NULL,
+        updated_at   DATETIME(3)  NOT NULL
     ) ENGINE=InnoDB
     """,
     """
@@ -41,48 +35,13 @@ SCHEMA = [
     """,
 ]
 
-# Upgrades for tables created by an older version of SCHEMA: (column, ALTER statement).
-_UPGRADES = [
-    ("deleted", "ALTER TABLE accounts ADD COLUMN deleted BOOLEAN NOT NULL DEFAULT FALSE"),
-]
-
-# Version-guarded upsert: an older copy (e.g. a backfill batch read before a live update) never
-# overwrites a newer row or tombstone. `version` is assigned last because MySQL applies assignments
-# left to right, and every IF() above it must compare against the old version.
-_UPSERT_IF_NEWER = text(
-    f"""
-    INSERT INTO accounts ({_COLUMNS}) VALUES ({_VALUES}) AS new
-    ON DUPLICATE KEY UPDATE
-        email        = IF(new.version > accounts.version, new.email,        accounts.email),
-        display_name = IF(new.version > accounts.version, new.display_name, accounts.display_name),
-        plan         = IF(new.version > accounts.version, new.plan,         accounts.plan),
-        settings     = IF(new.version > accounts.version, new.settings,     accounts.settings),
-        created_at   = IF(new.version > accounts.version, new.created_at,   accounts.created_at),
-        updated_at   = IF(new.version > accounts.version, new.updated_at,   accounts.updated_at),
-        deleted      = IF(new.version > accounts.version, FALSE,            accounts.deleted),
-        version      = GREATEST(accounts.version, new.version)
-    """
-)
-
-# Mirror a delete. If the row isn't here yet, insert a placeholder tombstone so a shadow write that
-# arrives later can't create it either.
-_UPSERT_TOMBSTONE = text(
-    f"""
-    INSERT INTO accounts ({_COLUMNS}, deleted)
-    VALUES (:id, '', '', '', '{{}}', :version, :now, :now, TRUE) AS new
-    ON DUPLICATE KEY UPDATE
-        updated_at = IF(new.version > accounts.version, new.updated_at, accounts.updated_at),
-        deleted    = IF(new.version > accounts.version, TRUE,           accounts.deleted),
-        version    = GREATEST(accounts.version, new.version)
-    """
-)
-
-_UPSERT_FORCE = text(
+# Insert the row, or overwrite it if it already exists. Last writer wins.
+_UPSERT = text(
     f"""
     INSERT INTO accounts ({_COLUMNS}) VALUES ({_VALUES}) AS new
     ON DUPLICATE KEY UPDATE
         email = new.email, display_name = new.display_name, plan = new.plan, settings = new.settings,
-        version = new.version, created_at = new.created_at, updated_at = new.updated_at, deleted = FALSE
+        created_at = new.created_at, updated_at = new.updated_at
     """
 )
 
@@ -107,16 +66,6 @@ class MySQLStore:
         with self.engine.begin() as conn:
             for ddl in SCHEMA:
                 conn.execute(text(ddl))
-            for column, ddl in _UPGRADES:
-                exists = conn.execute(
-                    text(
-                        "SELECT COUNT(*) FROM information_schema.columns"
-                        " WHERE table_schema = DATABASE() AND table_name = 'accounts' AND column_name = :c"
-                    ),
-                    {"c": column},
-                ).scalar_one()
-                if not exists:
-                    conn.execute(text(ddl))
 
     @staticmethod
     def from_row(row) -> Account:
@@ -129,7 +78,6 @@ class MySQLStore:
             display_name=row["display_name"],
             plan=row["plan"],
             settings=settings or {},
-            version=int(row["version"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -142,7 +90,6 @@ class MySQLStore:
             "display_name": a.display_name,
             "plan": a.plan,
             "settings": json.dumps(a.settings, sort_keys=True),
-            "version": a.version,
             "created_at": a.created_at,
             "updated_at": a.updated_at,
         }
@@ -150,7 +97,7 @@ class MySQLStore:
     # --- application operations -------------------------------------------------
 
     def get(self, id: str) -> Account | None:
-        stmt = text(f"SELECT {_COLUMNS} FROM accounts WHERE id = :id AND NOT deleted")
+        stmt = text(f"SELECT {_COLUMNS} FROM accounts WHERE id = :id")
         with self.engine.connect() as conn:
             row = conn.execute(stmt, {"id": id}).mappings().first()
         return self.from_row(row) if row else None
@@ -161,74 +108,50 @@ class MySQLStore:
 
     def update(self, id: str, changes: dict) -> Account | None:
         with self.engine.begin() as conn:
-            row = (
-                conn.execute(
-                    text(f"SELECT {_COLUMNS} FROM accounts WHERE id = :id AND NOT deleted FOR UPDATE"), {"id": id}
-                )
-                .mappings()
-                .first()
-            )
+            row = conn.execute(text(f"SELECT {_COLUMNS} FROM accounts WHERE id = :id FOR UPDATE"), {"id": id})
+            row = row.mappings().first()
             if row is None:
                 return None
-            current = self.from_row(row)
-            updated = replace(current, **changes, version=current.version + 1, updated_at=utcnow())
+            updated = replace(self.from_row(row), **changes, updated_at=utcnow())
             conn.execute(
                 text(
                     "UPDATE accounts SET email = :email, display_name = :display_name, plan = :plan,"
-                    " settings = :settings, version = :version, updated_at = :updated_at WHERE id = :id"
+                    " settings = :settings, updated_at = :updated_at WHERE id = :id"
                 ),
                 self.params(updated),
             )
             return updated
 
-    def delete(self, id: str) -> int | None:
-        """Tombstone a live record. Returns the tombstone's version, or None if there was nothing to delete."""
+    def delete(self, id: str) -> bool:
+        """Returns True if there was a record to delete."""
         with self.engine.begin() as conn:
-            changed = conn.execute(
-                text(
-                    "UPDATE accounts SET deleted = TRUE, version = version + 1, updated_at = :now"
-                    " WHERE id = :id AND NOT deleted"
-                ),
-                {"id": id, "now": utcnow()},
-            ).rowcount
-            if changed != 1:
-                return None
-            return int(conn.execute(text("SELECT version FROM accounts WHERE id = :id"), {"id": id}).scalar_one())
+            return conn.execute(text("DELETE FROM accounts WHERE id = :id"), {"id": id}).rowcount == 1
 
     # --- migration operations ---------------------------------------------------
 
-    def put_if_newer(self, a: Account) -> None:
+    def upsert(self, a: Account) -> None:
+        """Write this exact copy, inserting or overwriting. Last writer wins."""
         with self.engine.begin() as conn:
-            conn.execute(_UPSERT_IF_NEWER, self.params(a))
+            conn.execute(_UPSERT, self.params(a))
 
-    def put_if_newer_many(self, accounts: Iterable[Account]) -> None:
+    def upsert_many(self, accounts: Iterable[Account]) -> None:
         rows = [self.params(a) for a in accounts]
         if rows:
             with self.engine.begin() as conn:
-                conn.execute(_UPSERT_IF_NEWER, rows)
-
-    def put_tombstone(self, id: str, version: int) -> None:
-        with self.engine.begin() as conn:
-            conn.execute(_UPSERT_TOMBSTONE, {"id": id, "version": version, "now": utcnow()})
-
-    def force_put(self, a: Account) -> None:
-        with self.engine.begin() as conn:
-            conn.execute(_UPSERT_FORCE, self.params(a))
+                conn.execute(_UPSERT, rows)
 
     def get_many(self, ids: list[str]) -> dict[str, Account]:
         if not ids:
             return {}
-        stmt = text(f"SELECT {_COLUMNS} FROM accounts WHERE id IN :ids AND NOT deleted").bindparams(
-            bindparam("ids", expanding=True)
-        )
+        stmt = text(f"SELECT {_COLUMNS} FROM accounts WHERE id IN :ids").bindparams(bindparam("ids", expanding=True))
         with self.engine.connect() as conn:
             rows = conn.execute(stmt, {"ids": list(ids)}).mappings().all()
         return {r["id"]: self.from_row(r) for r in rows}
 
     def iter_batches(self, batch_size: int = 1000, after_id: str | None = None) -> Iterator[list[Account]]:
-        """Walk live records in id order. Keyset pagination keeps every batch cheap and makes the walk resumable."""
+        """Walk every record in id order. Keyset pagination keeps every batch cheap and makes the walk resumable."""
         after = after_id or ""
-        stmt = text(f"SELECT {_COLUMNS} FROM accounts WHERE id > :after AND NOT deleted ORDER BY id LIMIT :n")
+        stmt = text(f"SELECT {_COLUMNS} FROM accounts WHERE id > :after ORDER BY id LIMIT :n")
         while True:
             with self.engine.connect() as conn:
                 rows = conn.execute(stmt, {"after": after, "n": batch_size}).mappings().all()
@@ -242,7 +165,7 @@ class MySQLStore:
 
     def count(self) -> int:
         with self.engine.connect() as conn:
-            return int(conn.execute(text("SELECT COUNT(*) FROM accounts WHERE NOT deleted")).scalar_one())
+            return int(conn.execute(text("SELECT COUNT(*) FROM accounts")).scalar_one())
 
     def reset(self) -> None:
         with self.engine.begin() as conn:

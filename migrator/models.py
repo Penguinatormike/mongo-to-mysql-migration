@@ -23,14 +23,13 @@ def _ts(dt: datetime) -> str:
 
 @dataclass(frozen=True)
 class Account:
-    """The record being migrated. `version` increases on every write and guards against stale overwrites."""
+    """The record being migrated."""
 
     id: str
     email: str
     display_name: str
     plan: str
     settings: dict
-    version: int
     created_at: datetime
     updated_at: datetime
 
@@ -41,7 +40,6 @@ class Account:
             "display_name": self.display_name,
             "plan": self.plan,
             "settings": self.settings,
-            "version": self.version,
             "created_at": _ts(self.created_at) + "Z",
             "updated_at": _ts(self.updated_at) + "Z",
         }
@@ -54,7 +52,6 @@ class Account:
             "display_name": self.display_name,
             "plan": self.plan,
             "settings": self.settings,
-            "version": self.version,
             "created_at": _ts(self.created_at),
             "updated_at": _ts(self.updated_at),
         }

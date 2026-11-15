@@ -14,7 +14,7 @@ class ReconcileReport:
     checked: int = 0
     missing: list[str] = field(default_factory=list)  # in source, not in target
     mismatched: list[str] = field(default_factory=list)  # in both, contents differ
-    extra: list[str] = field(default_factory=list)  # in target, not in source (e.g. a resurrected delete)
+    extra: list[str] = field(default_factory=list)  # in target, not in source (e.g. a failed shadow delete)
     repaired: int = 0
     transient: int = 0  # differences that disappeared on re-check: in-flight writes, not drift
 
@@ -92,7 +92,7 @@ def reconcile(
             if current is None:
                 dst.delete(id)
             else:
-                dst.force_put(current)
+                dst.upsert(current)
             report.repaired += 1
 
     return report

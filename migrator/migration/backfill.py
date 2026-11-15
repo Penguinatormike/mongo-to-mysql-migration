@@ -37,13 +37,14 @@ def run_backfill(
 ) -> dict:
     """Walk Mongo in _id order and upsert each batch into MySQL.
 
-    Safe to run against live traffic because:
-      * it only runs once every app instance is dual-writing, so anything written after a batch is read
+    Runs against live traffic:
+      * it only starts once every app instance is dual-writing, so anything written after a batch is read
         reaches MySQL anyway;
-      * the upsert is version-guarded and deletes are versioned tombstones, so a batch read before a live
-        update or delete never clobbers it or brings the record back;
+      * a record updated or deleted between reading a batch and writing it gets the stale copy in MySQL
+        (the batch overwrites the update, or brings the deleted record back). The window is a few
+        milliseconds per batch, and the reconcile that follows the backfill repairs it;
       * progress is checkpointed, so a crashed or paused run picks up where it stopped. A finished run
-        clears the checkpoint, so running it again re-copies everything (harmless, thanks to the guard).
+        clears the checkpoint, so running it again re-copies everything.
 
     `propagation` is how long write_mysql must have been on before copying starts; it defaults to twice
     the settings cache TTL.
@@ -63,7 +64,7 @@ def run_backfill(
     started = time.monotonic()
 
     for batch in mongo.iter_batches(batch_size, after):
-        mysql.put_if_newer_many(batch)
+        mysql.upsert_many(batch)
         copied += len(batch)
         batches += 1
         if state is not None:

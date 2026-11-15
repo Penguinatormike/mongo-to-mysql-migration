@@ -37,17 +37,6 @@ def test_dual_write_keeps_both_stores_identical(stores):
     assert reconcile(mongo, mysql, settle=0).clean
 
 
-def test_late_update_shadow_cannot_resurrect_a_delete(stores):
-    mongo, mysql, _ = stores
-    repo = make_repo(stores, DUAL_WRITE)
-    a = repo.create(ACCOUNT_FIELDS)
-    v2 = mongo.update(a.id, {"plan": "pro"})  # primary write whose shadow write is delayed...
-    assert repo.delete(a.id)
-    mysql.put_if_newer(v2)  # ...and lands after the delete's
-    assert mysql.get(a.id) is None
-    assert reconcile(mongo, mysql, settle=0).clean
-
-
 def test_delete_still_removes_a_stray_shadow_copy(stores):
     mongo, mysql, _ = stores
     stray = make_account()

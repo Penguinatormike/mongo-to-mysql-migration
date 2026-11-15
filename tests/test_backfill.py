@@ -1,7 +1,6 @@
 """The backfill: flag guard, rollout wait, checkpointing, and staying safe under live writes."""
 
 import time
-from dataclasses import replace
 
 import pytest
 
@@ -18,15 +17,6 @@ def test_backfill_copies_everything(stores):
     result = run_backfill(mongo, mysql, batch_size=50)
     assert result["copied"] == 120
     assert reconcile(mongo, mysql, settle=0).clean
-
-
-def test_backfill_does_not_clobber_a_newer_dual_write(stores):
-    mongo, mysql, _ = stores
-    old = make_account(version=2, display_name="old")
-    mongo.create(old)
-    mysql.create(replace(old, version=3, display_name="written live"))
-    run_backfill(mongo, mysql)
-    assert mysql.get(old.id).display_name == "written live"
 
 
 def test_backfill_refuses_to_run_before_dual_writes(stores):
@@ -73,8 +63,8 @@ def test_backfill_waits_for_every_instance_to_see_dual_writes(stores):
     assert lines == []
 
 
-class _DeleteAfterRead:
-    """Wraps the source so a user deletes a record after the backfill has read its batch."""
+class _WriteAfterRead:
+    """Wraps the source so live traffic changes records after the backfill has read their batch."""
 
     def __init__(self, store, on_read):
         self.store, self.on_read = store, on_read
@@ -88,14 +78,22 @@ class _DeleteAfterRead:
         return getattr(self.store, name)
 
 
-def test_backfill_does_not_resurrect_a_record_deleted_mid_batch(stores):
+def test_writes_that_race_the_backfill_are_drift_the_reconciler_repairs(stores):
     mongo, mysql, _ = stores
     repo = make_repo(stores, DUAL_WRITE)
     for _ in range(5):
         mongo.create(make_account())
-    victim = next(mongo.iter_batches())[0]
+    updated, deleted = next(mongo.iter_batches())[:2]
 
-    run_backfill(_DeleteAfterRead(mongo, lambda batch: repo.delete(victim.id)), mysql)
-    assert mysql.get(victim.id) is None
-    assert mysql.count() == 4
+    def live_traffic(batch):
+        repo.update(updated.id, {"display_name": "changed live"})
+        repo.delete(deleted.id)
+
+    # The batch was read before those writes, so it copies the old record and brings back the deleted one.
+    run_backfill(_WriteAfterRead(mongo, live_traffic), mysql)
+    assert mysql.get(updated.id).display_name == "Ada"
+    assert mysql.get(deleted.id) is not None
+
+    report = reconcile(mongo, mysql, repair=True, settle=0)
+    assert (report.mismatched, report.extra) == ([updated.id], [deleted.id])
     assert reconcile(mongo, mysql, settle=0).clean

@@ -2,8 +2,8 @@
 
 Each worker owns the accounts it creates, so it knows exactly what a correct response looks like:
   * any non-2xx response or connection error counts as an error;
-  * reading back an older version than the worker last wrote counts as a consistency error;
-  * an update that doesn't bump the version by exactly one counts as a consistency error;
+  * reading back anything other than what the worker last wrote counts as a consistency error;
+  * an update whose response doesn't show the change counts as a consistency error;
   * an account that's still readable after its delete counts as a consistency error.
 """
 
@@ -77,7 +77,7 @@ WEIGHTS = [15, 30, 20, 25, 10]
 
 
 async def _worker(client, stats, stop, rng: random.Random, seed_ids: list[str], think: float) -> None:
-    owned: dict[str, int] = {}  # account id -> last version this worker wrote
+    owned: dict[str, dict] = {}  # account id -> the account as this worker last wrote it
     while not stop.is_set():
         op = rng.choices(OPS, WEIGHTS)[0]
         if not owned:
@@ -96,13 +96,13 @@ async def _worker(client, stats, stop, rng: random.Random, seed_ids: list[str], 
             }
             r = await _call(client, stats, "POST", "/accounts", 201, json=body)
             if r is not None:
-                owned[r.json()["id"]] = r.json()["version"]
+                owned[r.json()["id"]] = r.json()
 
         elif op == "read_own":
             id = rng.choice(list(owned))
             r = await _call(client, stats, "GET", f"/accounts/{id}", 200)
-            if r is not None and r.json()["version"] != owned[id]:
-                stats.inconsistent(f"stale read {id}: got v{r.json()['version']}, wrote v{owned[id]}")
+            if r is not None and r.json() != owned[id]:
+                stats.inconsistent(f"stale read {id}: got {r.json()}, wrote {owned[id]}")
 
         elif op == "read_seed":
             await _call(client, stats, "GET", f"/accounts/{rng.choice(seed_ids)}", 200)
@@ -112,10 +112,10 @@ async def _worker(client, stats, stop, rng: random.Random, seed_ids: list[str], 
             body = {"display_name": f"Load User {rng.randrange(10**6)}", "settings": {"theme": rng.choice(["light", "dark"])}}
             r = await _call(client, stats, "PATCH", f"/accounts/{id}", 200, json=body)
             if r is not None:
-                version = r.json()["version"]
-                if version != owned[id] + 1:
-                    stats.inconsistent(f"version skip {id}: v{owned[id]} -> v{version}")
-                owned[id] = version
+                got = r.json()
+                if (got["display_name"], got["settings"]) != (body["display_name"], body["settings"]):
+                    stats.inconsistent(f"update not applied {id}: sent {body}, got {got}")
+                owned[id] = got
 
         elif op == "delete":
             id = rng.choice(list(owned))

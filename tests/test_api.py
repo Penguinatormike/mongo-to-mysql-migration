@@ -15,12 +15,12 @@ def test_crud_works_under_every_runbook_step(stores, flags):
     r = client.post("/accounts", json={"email": "kim@example.com", "display_name": "Kim", "settings": {"x": 1}})
     assert r.status_code == 201
     account = r.json()
-    assert account["version"] == 1 and account["plan"] == "free"
+    assert account["plan"] == "free"
 
     assert client.get(f"/accounts/{account['id']}").json() == account
 
     r = client.patch(f"/accounts/{account['id']}", json={"plan": "pro"})
-    assert r.status_code == 200 and r.json()["version"] == 2 and r.json()["plan"] == "pro"
+    assert r.status_code == 200 and r.json()["plan"] == "pro"
 
     assert client.delete(f"/accounts/{account['id']}").status_code == 204
     assert client.get(f"/accounts/{account['id']}").status_code == 404

@@ -14,7 +14,7 @@ def test_reconcile_finds_and_repairs_every_kind_of_drift(stores):
         mongo.create(a)
     mysql.create(ok)
     mysql.create(replace(changed, display_name="out of date"))
-    mysql.create(extra)  # deleted in Mongo, resurrected in MySQL
+    mysql.create(extra)  # deleted in Mongo, but the shadow delete failed
 
     report = reconcile(mongo, mysql, settle=0)
     assert (report.missing, report.mismatched, report.extra) == ([missing.id], [changed.id], [extra.id])
@@ -74,7 +74,7 @@ def test_reconcile_until_clean_gives_up_after_max_passes(stores):
     mongo, mysql, _ = stores
 
     class _BrokenTarget(_LaggingTarget):
-        def force_put(self, account):
+        def upsert(self, account):
             pass  # repairs never stick
 
     mongo.create(make_account())

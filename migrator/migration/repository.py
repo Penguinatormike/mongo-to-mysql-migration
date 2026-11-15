@@ -49,28 +49,23 @@ class AccountRepository:
     def create(self, fields: dict) -> Account:
         flags = self.settings.flags()
         ts = utcnow()
-        account = Account(id=str(ObjectId()), version=1, created_at=ts, updated_at=ts, **fields)
+        account = Account(id=str(ObjectId()), created_at=ts, updated_at=ts, **fields)
         self.stores[flags.primary].create(account)
-        self._shadow(flags, "put_if_newer", account)
+        self._shadow(flags, "upsert", account)
         return account
 
     def update(self, id: str, changes: dict) -> Account | None:
         flags = self.settings.flags()
         account = self.stores[flags.primary].update(id, changes)
         if account is not None:
-            self._shadow(flags, "put_if_newer", account)
+            self._shadow(flags, "upsert", account)
         return account
 
     def delete(self, id: str) -> bool:
         flags = self.settings.flags()
-        version = self.stores[flags.primary].delete(id)
-        if version is not None:
-            # A versioned tombstone, so a late shadow update or a stale backfill copy can't resurrect it.
-            self._shadow(flags, "put_tombstone", id, version)
-        else:
-            # Nothing live in the primary, but a stray shadow copy would still be drift.
-            self._shadow(flags, "delete", id)
-        return version is not None
+        deleted = self.stores[flags.primary].delete(id)
+        self._shadow(flags, "delete", id)  # even if the primary had nothing: a stray shadow copy is drift
+        return deleted
 
     def shadow_store(self, flags):
         """The client for shadow writes under these flags. A shadow that also serves reads (read_mysql on,

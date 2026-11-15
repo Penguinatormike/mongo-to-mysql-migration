@@ -36,7 +36,6 @@ def seed(mongo: MongoStore, count: int, batch_size: int = 1000, rng_seed: int = 
                 "notifications": rng.random() < 0.6,
                 "timezone": rng.choice(["America/Vancouver", "America/Toronto", "Europe/London", "Asia/Tokyo"]),
             },
-            version=rng.randint(1, 8),
             created_at=created,
             updated_at=updated,
         )

@@ -36,7 +36,6 @@ def make_account(**overrides) -> Account:
         display_name="Ada",
         plan="pro",
         settings={"theme": "dark", "notifications": True},
-        version=1,
         created_at=ts,
         updated_at=ts,
     )

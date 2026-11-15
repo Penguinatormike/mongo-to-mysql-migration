@@ -9,7 +9,7 @@ A runnable recreation of a production migration I led: moving a service's data o
 The production system can't be shared, so this repo rebuilds the same approach around a small accounts API:
 
 - **Dual writes**, switched on and off with **feature flags**, one flag per step.
-- A **resumable backfill** that's safe to run against live writes.
+- A **resumable backfill** that runs against live writes.
 - A **reconciler** that finds drift and repairs it.
 - A **load generator** that checks every response, so "zero downtime" is measured rather than claimed.
 
@@ -22,7 +22,7 @@ docker compose run --rm --build tools demo
 
 The demo seeds 20,000 "legacy" accounts in MongoDB and starts 8 concurrent clients. It then flips the migration flags one at a time, with no pause in traffic.
 
-During dual writes the demo makes 5% of the writes to MySQL fail on purpose. **This fault injection is demo scaffolding, not part of the migration**: locally nothing fails on its own, so without it the reconciler would have nothing to catch. In production the drift came from real failures (timeouts, deploys mid-request). Every bit of drift in the demo comes from those injected failures: run `demo --fault-rate 0` and the first reconcile finds none. Failed shadow deletes dominate (`extra`) because nothing heals them, while a failed create or update is usually overwritten by the record's next write.
+During dual writes the demo makes 5% of the writes to MySQL fail on purpose. **This fault injection is demo scaffolding, not part of the migration**: locally nothing fails on its own, so without it the reconciler would have nothing to catch. In production the drift came from real failures (timeouts, deploys mid-request). Most of the demo's drift comes from those injected failures. The rest comes from writes that race the backfill (see below), so with `demo --fault-rate 0` the first reconcile finds little or nothing. Failed shadow deletes dominate (`extra`) because nothing heals them, while a failed create or update is usually overwritten by the record's next write.
 
 ```
 == 2. Dual writes ========================================================
@@ -30,25 +30,25 @@ During dual writes the demo makes 5% of the writes to MySQL fail on purpose. **T
   (demo-only fault injection: 5% of those MySQL writes are made to fail on purpose)
 
 == 3. Backfill existing documents ========================================
-  copied 20,599 documents in 42 batches (15.02s)
+  copied 20,560 documents in 42 batches (14.02s)
 
 == 4. Reconcile (verify only) ============================================
-  checked=20,677 missing=3 mismatched=6 extra=46 transient=6 repaired=0
+  checked=20,642 missing=9 mismatched=17 extra=52 transient=2 repaired=0
 
 == 5. Stop injecting faults, repair until clean ==========================
-  pass 1: checked=20,740 missing=3 mismatched=8 extra=47 transient=3 repaired=58
-  pass 2: checked=20,749 missing=0 mismatched=0 extra=0 transient=0 repaired=0
+  pass 1: checked=20,709 missing=9 mismatched=14 extra=52 transient=5 repaired=75
+  pass 2: checked=20,739 missing=0 mismatched=0 extra=0 transient=0 repaired=0
 
 == Result ================================================================
   after                 requests   errors  inconsistent
-  before                   2,301        0             0
-  write_mysql on          12,448        0             0
-  read_mysql on            1,639        0             0
-  mysql_primary on         1,831        0             0
-  write_mongo off          1,302        0             0
-  total                   19,521        0             0
-  latency p50=11.2ms p99=82.6ms
-  shadow writes: 7,105 ok, 249 failed (demo fault injection)
+  before                   2,398        0             0
+  write_mysql on          12,363        0             0
+  read_mysql on            1,601        0             0
+  mysql_primary on         1,981        0             0
+  write_mongo off          1,407        0             0
+  total                   19,750        0             0
+  latency p50=10.5ms p99=84.1ms
+  shadow writes: 7,067 ok, 233 failed (demo fault injection)
 
   PASS: zero failed requests, zero inconsistent reads, no drift
 ```
@@ -86,9 +86,7 @@ flowchart LR
 
 ## How it stays correct
 
-**Every record carries a `version`.** Each write increments it. Writes to the secondary copy and the backfill both use a *version-guarded upsert*, which only replaces a row if the incoming version is newer ([`stores/`](migrator/stores/)). Without it, a backfill batch read just before a live update would overwrite that update with stale data.
-
-**Deletes are versioned too.** A delete keeps the record as a *tombstone* with a bumped version, and the secondary gets the tombstone through the same guard. So a backfill batch read just before a delete, or an update's shadow write that arrives after the delete's, can't bring the record back: its version is lower than the tombstone's.
+**Copies are last-writer-wins, and the reconciler is the safety net.** Shadow writes, the backfill and repairs all *upsert*: insert the record, or overwrite it if it's already there ([`stores/`](migrator/stores/)). Deletes are real deletes, mirrored to the secondary. Nothing is conditional, so a few races can leave a stale copy behind. For example, the backfill reads a batch, a user updates or deletes one of those records, and then the batch is written, overwriting the update or bringing the record back. The window is a few milliseconds, and the reconcile that follows the backfill finds and repairs it. That's why every flag flip that depends on the copy comes after a reconcile that's clean.
 
 **Shadow writes never fail a request.** The primary write has already succeeded. If the shadow write fails, the app logs and counts it and moves on ([`migration/repository.py`](migrator/migration/repository.py)). Drift is the reconciler's job, not the user's problem. Shadow writes to a database that isn't serving reads go through clients with a short timeout (`SHADOW_TIMEOUT_SECONDS`, default 1s), so a hung secondary can't stall requests either.
 
@@ -105,8 +103,8 @@ With live traffic, a write can land between reading the two stores, so every sus
 **The load generator checks that every response is correct, not just that it came back** ([`demo/loadgen.py`](migrator/demo/loadgen.py)). Each client owns the accounts it creates, so it knows the right answer. It flags:
 
 - any non-2xx response or connection error;
-- a read that returns an older version than the client last wrote;
-- an update that doesn't bump the version by exactly one;
+- a read that returns anything other than what the client last wrote;
+- an update whose response doesn't show the change;
 - an account that's still readable after its delete.
 
 ## Running it yourself
@@ -150,7 +148,7 @@ migrator/
   migration/
     flags.py       the feature flags and the cached view the app reads
     repository.py  flag-driven routing + shadow writes
-    backfill.py    resumable, version-guarded bulk copy
+    backfill.py    resumable bulk copy
     reconcile.py   two-way diff + repair
   demo/            demo-only code, outside the coverage gate
     run.py         the end-to-end run
@@ -168,8 +166,7 @@ This is a demo. These are the known gaps between it and something you'd run in p
 - **The feature flags live in MySQL**, standing in for a feature-flag service. If MySQL is down the app can't read its flags and requests fail, even before the migration starts. A real flag client would keep serving the last known value.
 - **Changing which database is primary isn't fenced.** During the 0.5s it takes every instance to pick up a `mysql_primary` flip, an in-flight request can still write to the old primary. The demo relies on watching the logs and metrics and flipping only after a clean reconcile; a real system would add a brief write freeze or reject writes made under stale flags.
 - **Failed shadow writes are only counted.** Finding them again means a full reconcile of both stores. At scale you'd record the failed IDs (an outbox) or replace dual writes with change data capture (MongoDB change streams).
-- **A reconciler repair can briefly overwrite a newer copy with an older one** if a live write lands mid-repair. The next pass fixes it, which is why the demo repairs until a pass comes back clean.
-- **Tombstones are never purged.** A real cutover would purge them once `write_mongo` is off for good.
+- **Copies aren't guarded against races.** A backfill batch or a reconciler repair can overwrite a newer copy, or bring back a deleted record, if a live write lands in the same few milliseconds. The reconciler catches it, which is why the demo repairs until a pass comes back clean. A stricter design adds a `version` to every record and only lets a copy overwrite an older one (keeping deletes as versioned tombstones), so races can't cause drift at all.
 - **No auth, hard-coded credentials, schema created on startup** instead of with a migration tool, and the demo's fault injection (scaffolding, not part of the migration) sits in the request path, switched off unless `ENABLE_FAULT_INJECTION=1`.
 - **One collection and one app instance.** The real migration moved about ten collections across many instances, with:
   - per-collection flags, each collection going through these steps on its own;
